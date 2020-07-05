@@ -48,7 +48,7 @@ usage() {
     set +x
     cat 1>&2 <<HERE
 
-Script for installing a BigBlueButton 2.2 (or later) server in about 15 minutes.
+Script for installing a BigBlueButton 2.2 (or later) server in under 30 minutes.
 
 This script also supports installation of a coturn (TURN) server on a separate server.
 
@@ -61,7 +61,9 @@ OPTIONS (install BigBlueButton):
 
   -s <hostname>          Configure server with <hostname>
   -e <email>             Email for Let's Encrypt certbot
+
   -x                     Use Let's Encrypt certbot with manual dns challenges
+
   -a                     Install BBB API demos
   -g                     Install Greenlight
   -c <hostname>:<secret> Configure with coturn server at <hostname> using <secret>
@@ -72,6 +74,7 @@ OPTIONS (install BigBlueButton):
   -r <host>              Use alternative apt repository (such as packages-eu.bigbluebutton.org)
 
   -d                     Skip SSL certificates request (use provided certificates from mounted volume)
+  -w                     Install UFW firewall
 
   -h                     Print help
 
@@ -112,10 +115,11 @@ main() {
   export DEBIAN_FRONTEND=noninteractive
   PACKAGE_REPOSITORY=ubuntu.bigbluebutton.org
   LETS_ENCRYPT_OPTIONS="--webroot --non-interactive"
+  SOURCES_FETCHED=false
 
   need_x64
 
-  while builtin getopts "hs:r:c:v:e:p:m:lxgtad" opt "${@}"; do
+  while builtin getopts "hs:r:c:v:e:p:m:lxgtadw" opt "${@}"; do
 
     case $opt in
       h)
@@ -128,7 +132,6 @@ main() {
         if [ "$HOST" == "bbb.example.com" ]; then 
           err "You must specify a valid hostname (not the hostname given in the docs)."
         fi
-        check_host $HOST
         ;;
       r)
         PACKAGE_REPOSITORY=$OPTARG
@@ -148,11 +151,13 @@ main() {
         ;;
       v)
         VERSION=$OPTARG
-        check_version $VERSION
         ;;
 
       p)
         PROXY=$OPTARG
+        if [ ! -z "$PROXY" ]; then
+          echo "Acquire::http::Proxy \"http://$PROXY:3142\";"  > /etc/apt/apt.conf.d/01proxy
+        fi
         ;;
 
       l)
@@ -170,6 +175,13 @@ main() {
       d)
         PROVIDED_CERTIFICATE=true
         ;;
+      w)
+        SSH_PORT=$(grep Port /etc/ssh/ssh_config | grep -v \# | sed 's/[^0-9]*//g')
+        if [[ ! -z "$SSH_PORT" && "$SSH_PORT" != "22" ]]; then
+          err "Detected sshd not listening to standard port 22 -- unable to install default UFW firewall rules.  See http://docs.bigbluebutton.org/2.2/customize.html#secure-your-system--restrict-access-to-specific-ports"
+        fi
+        UFW=true
+        ;;
 
       :)
         err "Missing option argument for -$OPTARG"
@@ -183,11 +195,15 @@ main() {
     esac
   done
 
-  check_apache2
-
-  if [ ! -z "$PROXY" ]; then
-    echo "Acquire::http::Proxy \"http://$PROXY:3142\";"  > /etc/apt/apt.conf.d/01proxy
+  if [ ! -z "$HOST" ]; then
+    check_host $HOST
   fi
+
+  if [ ! -z "$VERSION" ]; then
+    check_version $VERSION
+  fi
+
+  check_apache2
 
   # Check if we're installing coturn (need an e-mail address for Let's Encrypt)
   if [ -z "$VERSION" ] && [ ! -z "$LETS_ENCRYPT_ONLY" ]; then
@@ -232,8 +248,9 @@ main() {
 
   if [ "$DISTRO" == "xenial" ]; then 
     rm -rf /etc/apt/sources.list.d/jonathonf-ubuntu-ffmpeg-4-xenial.list 
+    need_ppa rmescandon-ubuntu-yq-xenial.list         ppa:rmescandon/yq         CC86BB64 # Edit yaml files with yq
+    need_ppa libreoffice-ubuntu-ppa-xenial.list       ppa:libreoffice/ppa       1378B444 # Latest libreoffice
     need_ppa bigbluebutton-ubuntu-support-xenial.list ppa:bigbluebutton/support E95B94BC # Latest version of ffmpeg
-    need_ppa rmescandon-ubuntu-yq-xenial.list ppa:rmescandon/yq                 CC86BB64 # Edit yaml files with yq
     apt-get -y -o DPkg::options::="--force-confdef" -o DPkg::options::="--force-confold" install grub-pc update-notifier-common
 
     # Remove default version of nodejs for Ubuntu 16.04 if installed
@@ -267,11 +284,11 @@ main() {
     need_ppa bigbluebutton-ubuntu-support-bionic.list ppa:bigbluebutton/support  E95B94BC # Latest version of ffmpeg
     if ! apt-key list 5AFA7A83 | grep -q -E "1024|4096"; then   # Add Kurento package
       sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 5AFA7A83
-      sudo tee "/etc/apt/sources.list.d/kurento.list" >/dev/null <<HERE
-# Kurento Media Server - Release packages
-deb [arch=amd64] http://ubuntu.openvidu.io/6.13.0 $DISTRO kms6
-HERE
     fi
+    sudo tee "/etc/apt/sources.list.d/kurento.list" >/dev/null <<HERE
+# Kurento Media Server - Release packages
+deb [arch=amd64] http://ubuntu.openvidu.io/6.13.2 $DISTRO kms6
+HERE
 
     if [ ! -f /etc/apt/sources.list.d/nodesource.list ]; then
       curl -sL https://deb.nodesource.com/setup_12.x | sudo -E bash -
@@ -339,6 +356,10 @@ HERE
   if systemctl status freeswitch.service | grep -q SETSCHEDULER; then
     sed -i "s/^CPUSchedulingPolicy=rr/#CPUSchedulingPolicy=rr/g" /lib/systemd/system/freeswitch.service
     systemctl daemon-reload
+  fi
+
+  if [ "$UFW" == "true" ]; then
+   setup_ufw 
   fi
 
   if [ ! -z "$HOST" ]; then
@@ -441,6 +462,11 @@ get_IP() {
 
 need_pkg() {
   check_root
+
+  if [ ! "$SOURCES_FETCHED" = true ]; then
+    apt-get update
+    SOURCES_FETCHED=true
+  fi
 
   if ! dpkg -s ${@:1} >/dev/null 2>&1; then
     LC_CTYPE=C.UTF-8 apt-get install -yq ${@:1}
@@ -616,8 +642,8 @@ HERE
 configure_HTML5() {
   # Use Google's default STUN server
   if [ ! -z "$INTERNAL_IP" ]; then
-   sed -i 's/;stunServerAddress.*/stunServerAddress=64.233.177.127/g' /etc/kurento/modules/kurento/WebRtcEndpoint.conf.ini
-   sed -i 's/;stunServerPort.*/stunServerPort=19302/g'                /etc/kurento/modules/kurento/WebRtcEndpoint.conf.ini
+   sed -i 's/;stunServerAddress.*/stunServerAddress=172.217.212.127/g' /etc/kurento/modules/kurento/WebRtcEndpoint.conf.ini
+   sed -i 's/;stunServerPort.*/stunServerPort=19302/g'                 /etc/kurento/modules/kurento/WebRtcEndpoint.conf.ini
   fi
 
   if [ -f /var/www/bigbluebutton/client/conf/config.xml ]; then
@@ -679,11 +705,13 @@ install_greenlight(){
 
   BIGBLUEBUTTON_URL=$(cat $SERVLET_DIR/WEB-INF/classes/bigbluebutton.properties | grep -v '#' | sed -n '/^bigbluebutton.web.serverURL/{s/.*=//;p}')/bigbluebutton/
   BIGBLUEBUTTON_SECRET=$(cat $SERVLET_DIR/WEB-INF/classes/bigbluebutton.properties   | grep -v '#' | grep securitySalt | cut -d= -f2)
+  SAFE_HOSTS=$(cat $SERVLET_DIR/WEB-INF/classes/bigbluebutton.properties | grep -v '#' | sed -n '/^bigbluebutton.web.serverURL/{s/.*=//;p}' | sed 's/https\?:\/\///')
 
   # Update Greenlight configuration file in ~/greenlight/env
   sed -i "s|SECRET_KEY_BASE=.*|SECRET_KEY_BASE=$SECRET_KEY_BASE|"                   ~/greenlight/.env
   sed -i "s|.*BIGBLUEBUTTON_ENDPOINT=.*|BIGBLUEBUTTON_ENDPOINT=$BIGBLUEBUTTON_URL|" ~/greenlight/.env
   sed -i "s|.*BIGBLUEBUTTON_SECRET=.*|BIGBLUEBUTTON_SECRET=$BIGBLUEBUTTON_SECRET|"  ~/greenlight/.env
+  sed -i "s|SAFE_HOSTS=.*|SAFE_HOSTS=$SAFE_HOSTS|"                                  ~/greenlight/.env
 
   # need_pkg bbb-webhooks
 
@@ -796,18 +824,26 @@ server {
   listen 80;
   listen [::]:80;
   server_name $HOST;
+  
+  return 301 https://\$server_name\$request_uri; #redirect HTTP to HTTPS
 
+}
+server {
   listen 443 ssl;
   listen [::]:443 ssl;
+  server_name $HOST;
 
     ssl_certificate /etc/letsencrypt/live/$HOST/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$HOST/privkey.pem;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
-    ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
-    ssl_ciphers "ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:ECDH+3DES:DH+3DES:RSA+AESGCM:RSA+AES:RSA+3DES:!aNULL:!MD5:!DSS:!AES256";
+    ssl_protocols TLSv1.2;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
     ssl_prefer_server_ciphers on;
     ssl_dhparam /etc/nginx/ssl/dhp-4096.pem;
+    
+    # HSTS (comment out to enable)
+    #add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
   access_log  /var/log/nginx/bigbluebutton.access.log;
 
@@ -871,8 +907,7 @@ HERE
   # Configure rest of BigBlueButton Configuration for SSL
   sed -i "s/<param name=\"wss-binding\"  value=\"[^\"]*\"\/>/<param name=\"wss-binding\"  value=\"$IP:7443\"\/>/g" /opt/freeswitch/conf/sip_profiles/external.xml
 
-  sed -i 's/http:/https:/g' /etc/bigbluebutton/nginx/sip.nginx
-  sed -i 's/5066/7443/g'    /etc/bigbluebutton/nginx/sip.nginx
+  sed -i "s/proxy_pass .*/proxy_pass https:\/\/$IP:7443;/g" /etc/bigbluebutton/nginx/sip.nginx
 
   sed -i 's/bigbluebutton.web.serverURL=http:/bigbluebutton.web.serverURL=https:/g' $SERVLET_DIR/WEB-INF/classes/bigbluebutton.properties
 
@@ -915,7 +950,12 @@ HERE
     else
       # 2.2
       yq w -i $TARGET kurento[0].ip "$IP"
-      yq w -i $TARGET freeswitch.sip_ip "$IP"
+      yq w -i $TARGET freeswitch.ip "$IP"
+      if [ ! -z "$INTERNAL_IP" ]; then
+        yq w -i $TARGET freeswitch.sip_ip "$INTERNAL_IP"
+      else
+        yq w -i $TARGET freeswitch.sip_ip "$IP"
+      fi
     fi
     chown bigbluebutton:bigbluebutton $TARGET
     chmod 644 $TARGET
@@ -1098,6 +1138,20 @@ HERE
 # the the bbb-install.sh command.
 #
 HERE
+}
+
+setup_ufw() {
+  if [ ! -f /etc/bigbluebutton/bbb-conf/apply-config.sh ]; then
+    cat > /etc/bigbluebutton/bbb-conf/apply-config.sh << HERE
+#!/bin/bash
+
+# Pull in the helper functions for configuring BigBlueButton
+source /etc/bigbluebutton/bbb-conf/apply-lib.sh
+
+enableUFWRules
+HERE
+  chmod +x /etc/bigbluebutton/bbb-conf/apply-config.sh
+  fi
 }
 
 main "$@" || exit 1
